@@ -1,5 +1,5 @@
-#ifndef __IMAGE_H__
-#define __IMAGE_H__
+#ifndef __TGAIMAGE_H__
+#define __TGAIMAGE_H__
 
 #include <stdbool.h>
 
@@ -46,20 +46,20 @@ typedef struct{
 	int bytespp;
 }TGAImage;
 extern TGAImage tgai_create(int w, int h, int bpp);
-extern void tgai_release(TGAImage img);
-extern void tgai_copy(TGAImage destin, TGAImage source);
-extern int tgai_get_bytespp(TGAImage img);
-extern int tgai_get_width(TGAImage img);
-extern int tgai_get_height(TGAImage img);
-extern unsigned char *tgai_buffer(TGAImage img);
-extern void tgai_clear(TGAImage img);
-//extern bool tgai_scale(TGAImage img, int w, int h);
-extern TGAColor tgai_get(TGAImage img, int x, int y);
-extern bool tgai_set(TGAImage img, int x, int y, TGAColor c);
-extern bool tgai_flip_vertically(TGAImage img);
-extern bool tgai_flip_horizontally(TGAImage img);
-extern bool tgai_read_file(TGAImage img, const char *filename);
-extern bool tgai_write_tga_file(TGAImage img, const char *filename, bool rle);
+extern void tgai_release(TGAImage *img);
+extern void tgai_copy(TGAImage *destin, TGAImage *source);
+extern int tgai_get_bytespp(TGAImage *img);
+extern int tgai_get_width(TGAImage *img);
+extern int tgai_get_height(TGAImage *img);
+extern unsigned char *tgai_buffer(TGAImage *img);
+extern void tgai_clear(TGAImage *img);
+//extern bool tgai_scale(TGAImage *img, int w, int h);
+extern TGAColor tgai_get(TGAImage *img, int x, int y);
+extern bool tgai_set(TGAImage *img, int x, int y, TGAColor c);
+extern bool tgai_flip_vertically(TGAImage *img);
+extern bool tgai_flip_horizontally(TGAImage *img);
+extern bool tgai_read_file(TGAImage *img, const char *filename);
+extern bool tgai_write_tga_file(TGAImage *img, const char *filename, bool rle);
 extern void tgai_test(void);
 
 #endif //__IMAGE_H__

@@ -8,6 +8,16 @@
         "istream": "c",
         "functional": "c",
         "tuple": "c",
-        "utility": "c"
+        "utility": "c",
+        "tgaimage.h": "c",
+        "deque": "c",
+        "unordered_map": "c",
+        "vector": "c",
+        "optional": "c",
+        "fstream": "c",
+        "ostream": "c",
+        "sstream": "c",
+        "streambuf": "c",
+        "type_traits": "c"
     }
 }
