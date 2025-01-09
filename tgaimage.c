@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "tgaimage.h"
+#include "tile_cache.h"
 
 
 TGAColor tgacolor_rgba(unsigned char R, unsigned char G, unsigned char B, unsigned char A)
@@ -190,7 +191,7 @@ bool load_rle_data(TGAImage *img, FILE *fp) {
 	do {
 		unsigned char chunkheader = 0;
 		chunkheader = fgetc(fp);
-		if (chunkheader == EOF) {
+		if ((char)chunkheader == EOF) {
 			printf("an error occured while reading the data\n");
 			return false;
 		}

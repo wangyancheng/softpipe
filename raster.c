@@ -72,12 +72,9 @@ void rs_triangle(Vec2i *pts, TGAImage *image, TGAColor color) {
         int segment_height = second_half ? pts[2].y-pts[1].y : pts[1].y-pts[0].y;
         float alpha = (float)i/total_height;
         float beta  = (float)(i-(second_half ? pts[1].y-pts[0].y : 0))/segment_height; // be careful: with above conditions no division by zero here
-        Vec2i A;
-        A.x = pts[0].x + (pts[2].x-pts[0].x)*alpha;
-        A.y = pts[0].y + (pts[2].y-pts[0].y)*alpha;
-        Vec2i B;
-        B.x = second_half ? pts[1].x + (pts[2].x-pts[1].x)*beta : pts[0].x + (pts[1].x-pts[0].x)*beta;
-        B.y = second_half ? pts[1].y + (pts[2].y-pts[1].y)*beta : pts[0].y + (pts[1].y-pts[0].y)*beta;
+        Vec2i A = Vec2i_init(pts[0].x + (pts[2].x-pts[0].x)*alpha, pts[0].y + (pts[2].y-pts[0].y)*alpha);
+        Vec2i B = Vec2i_init(second_half ? pts[1].x + (pts[2].x-pts[1].x)*beta : pts[0].x + (pts[1].x-pts[0].x)*beta, \
+                            second_half ? pts[1].y + (pts[2].y-pts[1].y)*beta : pts[0].y + (pts[1].y-pts[0].y)*beta);
         if (A.x>B.x) swapv2i(&A, &B);
         for (int j=A.x; j<=B.x; j++) {
             tgai_set(image, j, pts[0].y+i, color); // attention, due to int casts t0.y+i != A.y

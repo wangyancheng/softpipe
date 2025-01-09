@@ -18,6 +18,9 @@
         "ostream": "c",
         "sstream": "c",
         "streambuf": "c",
-        "type_traits": "c"
-    }
+        "type_traits": "c",
+        "debug_img.h": "c",
+        "quad_blend.h": "c"
+    },
+    "makefile.configureOnOpen": false
 }
