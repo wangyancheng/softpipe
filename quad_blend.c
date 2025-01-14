@@ -127,7 +127,7 @@ single_output_color(struct quad_stage *qs,
             }
          }
       }
-      if(1){
+      if(0){
          union tile_address addr = tile_address(quads[0]->input.x0, 
                                     quads[0]->input.y0, quads[0]->input.layer);
          const int pos = CACHE_POS(addr.bits.x,

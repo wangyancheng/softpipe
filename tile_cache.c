@@ -465,7 +465,7 @@ pipe_put_tile_rgba_format(struct pipe_transfer *pt,
 
    //暂时注释掉
    //packed = MALLOC(util_format_get_nblocks(format, w, h) * util_format_get_blocksize(format));
-   packed = MALLOC(4096 * 4);
+   packed = MALLOC(w * h * 4);
 
    if (!packed)
       return;

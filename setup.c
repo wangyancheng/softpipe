@@ -170,6 +170,333 @@ clip_emit_quad(struct setup_context *setup, struct quad_header *quad)
    }
 }
 
+/**
+ * 计算A0，dadx和dady，以线性插值系数，
+ * 为了一行。
+ * V [0]和V [1]分别为Vmin和Vmax。
+ */
+static void
+line_linear_coeff(const struct setup_context *setup,
+                  struct tgsi_interp_coef *coef,
+                  uint i,
+                  const float v[2])
+{
+   const float da = v[1] - v[0];
+   const float dadx = da * setup->emaj.dx * setup->oneoverarea;
+   const float dady = da * setup->emaj.dy * setup->oneoverarea;
+   coef->dadx[i] = dadx;
+   coef->dady[i] = dady;
+   coef->a0[i] = (v[0] -
+                  (dadx * (setup->vmin[0][0] - setup->pixel_offset) +
+                   dady * (setup->vmin[0][1] - setup->pixel_offset)));
+}
+
+/* 如果启用了V0，将圆柱形包裹应用于V0，V1坐标。
+ * 输入坐标必须在[0，1]范围内，否则结果不确定。
+ */
+static void
+line_apply_cylindrical_wrap(float v0,
+                            float v1,
+                            uint cylindrical_wrap,
+                            float output[2])
+{
+   if (cylindrical_wrap) {
+      float delta;
+
+      delta = v1 - v0;
+      if (delta > 0.5f) {
+         v0 += 1.0f;
+      }
+      else if (delta < -0.5f) {
+         v1 += 1.0f;
+      }
+   }
+
+   output[0] = v0;
+   output[1] = v1;
+}
+
+/**
+ * Compute a0, dadx and dady for a perspective-corrected interpolant,
+ * for a line.
+ * v[0] and v[1] are vmin and vmax, respectively.
+ */
+static void
+line_persp_coeff(const struct setup_context *setup,
+                 struct tgsi_interp_coef *coef,
+                 uint i,
+                 const float v[2])
+{
+   const float a0 = v[0] * setup->vmin[0][3];
+   const float a1 = v[1] * setup->vmax[0][3];
+   const float da = a1 - a0;
+   const float dadx = da * setup->emaj.dx * setup->oneoverarea;
+   const float dady = da * setup->emaj.dy * setup->oneoverarea;
+   coef->dadx[i] = dadx;
+   coef->dady[i] = dady;
+   coef->a0[i] = (a0 -
+                  (dadx * (setup->vmin[0][0] - setup->pixel_offset) +
+                   dady * (setup->vmin[0][1] - setup->pixel_offset)));
+}
+
+/**
+ * 计算设置 - > coef [] array dadx，dady，a0值。
+ * 必须在设置 - > vmin后调用VMAX初始化。
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param coef -[in/out] 插值系数
+ * \param i -[in] 组件索引
+ * \param v -[in] 顶点数据
+ */
+static bool
+setup_line_coefficients(struct setup_context *setup,
+                        const float (*v0)[4],
+                        const float (*v1)[4])
+{
+   struct softpipe_context *softpipe = setup->softpipe;
+   const struct tgsi_shader_info *fsInfo = &setup->softpipe->fs_variant->info;  //片段着色器信息
+   const struct sp_setup_info *sinfo = &softpipe->setup_info;   //顶点设置信息
+   uint fragSlot;
+   float area;
+   float v[2];          //线段的两个顶点
+
+   assert(sinfo->valid);
+
+   /* use setup->vmin, vmax to point to vertices */
+   if (softpipe->rasterizer->flatshade_first)
+      setup->vprovoke = v0;
+   else
+      setup->vprovoke = v1;
+   setup->vmin = v0;
+   setup->vmax = v1;
+
+   setup->emaj.dx = setup->vmax[0][0] - setup->vmin[0][0];      //线段的x长度
+   setup->emaj.dy = setup->vmax[0][1] - setup->vmin[0][1];      //线段的y长度
+
+   /* 注意：这实际上不是面积，而是与面积成比例的。 */
+   area = setup->emaj.dx * setup->emaj.dx + setup->emaj.dy * setup->emaj.dy;
+   if (area == 0.0f || util_is_inf_or_nan(area))
+      return false;
+   setup->oneoverarea = 1.0f / area;
+
+   /* z 和 w 通过线性插值完成：    */
+   v[0] = setup->vmin[0][2];            //线段的z坐标
+   v[1] = setup->vmax[0][2];
+   line_linear_coeff(setup, &setup->posCoef, 2, v);
+
+   v[0] = setup->vmin[0][3];
+   v[1] = setup->vmax[0][3];
+   line_linear_coeff(setup, &setup->posCoef, 3, v);
+
+   /* 为所有剩余属性设置插值：
+    */
+   for (fragSlot = 0; fragSlot < fsInfo->num_inputs; fragSlot++) {
+      const uint vertSlot = sinfo->attrib[fragSlot].src_index;
+      uint j;
+
+      switch (sinfo->attrib[fragSlot].interp) {
+      case SP_INTERP_CONSTANT:              //常量插值
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++)
+            const_coeff(setup, &setup->coef[fragSlot], vertSlot, j);
+         break;
+      case SP_INTERP_LINEAR:                 //线性插值
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            line_apply_cylindrical_wrap(setup->vmin[vertSlot][j],
+                                        setup->vmax[vertSlot][j],
+                                        fsInfo->input_cylindrical_wrap[fragSlot] & (1 << j),
+                                        v);
+            line_linear_coeff(setup, &setup->coef[fragSlot], j, v);
+         }
+         break;
+      case SP_INTERP_PERSPECTIVE:            //透视插值
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            line_apply_cylindrical_wrap(setup->vmin[vertSlot][j],
+                                        setup->vmax[vertSlot][j],
+                                        fsInfo->input_cylindrical_wrap[fragSlot] & (1 << j),
+                                        v);
+            line_persp_coeff(setup, &setup->coef[fragSlot], j, v);
+         }
+         break;
+      case SP_INTERP_POS:                   //点精灵，纹理坐标插值
+         setup_fragcoord_coeff(setup, fragSlot);
+         break;
+      default:
+         assert(0);
+      }
+
+      if (fsInfo->input_semantic_name[fragSlot] == TGSI_SEMANTIC_FACE) {
+         /* convert 0 to 1.0 and 1 to -1.0 */
+         setup->coef[fragSlot].a0[0] = setup->facing * -2.0f + 1.0f;
+         setup->coef[fragSlot].dadx[0] = 0.0;
+         setup->coef[fragSlot].dady[0] = 0.0;
+      }
+   }
+   return true;
+}
+
+/**
+ * 在线段中绘制一个像素。
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param x -[in] 线的x坐标
+ * \param y -[in] 线的y坐标
+ */
+static inline void
+plot(struct setup_context *setup, int x, int y)
+{
+   const int iy = y & 1;
+   const int ix = x & 1;
+   const int quadX = x - ix;
+   const int quadY = y - iy;
+   const int mask = (1 << ix) << (2 * iy);
+
+   if (quadX != setup->quad[0].input.x0 ||
+       quadY != setup->quad[0].input.y0)
+   {
+      /* flush prev quad, start new quad */
+
+      if (setup->quad[0].input.x0 != -1)
+         clip_emit_quad(setup, &setup->quad[0]);
+
+      setup->quad[0].input.x0 = quadX;
+      setup->quad[0].input.y0 = quadY;
+      setup->quad[0].inout.mask = 0x0;
+   }
+
+   setup->quad[0].inout.mask |= mask;
+}
+
+/**
+ * 线光栅化，单位线宽度。线宽大于1被渲染成两个三角形。
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param v0 -[in] 线的第一个顶点
+ * \param v1 -[in] 线的第二个顶点
+ */
+void
+sp_setup_line(struct setup_context *setup,
+              const float (*v0)[4],
+              const float (*v1)[4])
+{
+   int x0 = (int) v0[0][0];
+   int x1 = (int) v1[0][0];
+   int y0 = (int) v0[0][1];
+   int y1 = (int) v1[0][1];
+   int dx = x1 - x0;
+   int dy = y1 - y0;
+   int xstep, ystep;
+   uint layer = 0;
+   unsigned viewport_index = 0;
+
+#if DEBUG_VERTS
+   printf("Setup line:\n");
+   print_vertex(setup, v0);
+   print_vertex(setup, v1);
+#endif
+
+   if (setup->softpipe->rasterizer->rasterizer_discard)
+      return;
+
+   if (dx == 0 && dy == 0)
+      return;
+    
+   if (!setup_line_coefficients(setup, v0, v1))
+      return;
+
+   assert(v0[0][0] < 1.0e9);
+   assert(v0[0][1] < 1.0e9);
+   assert(v1[0][0] < 1.0e9);
+   assert(v1[0][1] < 1.0e9);
+
+   if (dx < 0) {
+      dx = -dx;   /* make positive */
+      xstep = -1;
+   }
+   else {
+      xstep = 1;
+   }
+
+   if (dy < 0) {
+      dy = -dy;   /* make positive */
+      ystep = -1;
+   }
+   else {
+      ystep = 1;
+   }
+
+   assert(dx >= 0);
+   assert(dy >= 0);
+   assert(setup->softpipe->reduced_prim == PIPE_PRIM_LINES);
+
+   setup->quad[0].input.x0 = setup->quad[0].input.y0 = -1;
+   setup->quad[0].inout.mask = 0x0;
+   if (setup->softpipe->layer_slot > 0) {
+      layer = *(unsigned *)setup->vprovoke[setup->softpipe->layer_slot];
+      layer = MIN2(layer, setup->max_layer);
+   }
+   setup->quad[0].input.layer = layer;
+
+   if (setup->softpipe->viewport_index_slot > 0) {
+      unsigned *udata = (unsigned*)setup->vprovoke[setup->softpipe->viewport_index_slot];
+      viewport_index = sp_clamp_viewport_idx(*udata);
+   }
+   setup->quad[0].input.viewport_index = viewport_index;
+
+   /* XXX temporary: set coverage to 1.0 so the line appears
+    * if AA mode happens to be enabled.
+    */
+   setup->quad[0].input.coverage[0] =
+   setup->quad[0].input.coverage[1] =
+   setup->quad[0].input.coverage[2] =
+   setup->quad[0].input.coverage[3] = 1.0;
+
+   if (dx > dy) {
+      /*** X-major line ***/
+      int i;
+      const int errorInc = dy + dy;
+      int error = errorInc - dx;
+      const int errorDec = error - dx;
+
+      for (i = 0; i < dx; i++) {
+         plot(setup, x0, y0);
+
+         x0 += xstep;
+         if (error < 0) {
+            error += errorInc;
+         }
+         else {
+            error += errorDec;
+            y0 += ystep;
+         }
+      }
+   }
+   else {
+      /*** Y-major line ***/
+      int i;
+      const int errorInc = dx + dx;
+      int error = errorInc - dy;
+      const int errorDec = error - dy;
+
+      for (i = 0; i < dy; i++) {
+         plot(setup, x0, y0);
+
+         y0 += ystep;
+         if (error < 0) {
+            error += errorInc;
+         }
+         else {
+            error += errorDec;
+            x0 += xstep;
+         }
+      }
+   }
+
+   /* draw final quad */
+   if (setup->quad[0].inout.mask) {
+      clip_emit_quad(setup, &setup->quad[0]);
+   }
+}
+
 
 /**
  * setup点
@@ -575,7 +902,7 @@ void setup_test(void)
         softpipe->setup_info.attrib[i].interp = 0;
     }
     
-    softpipe->psize_slot = -1;
+    softpipe->psize_slot = -1;          //点大小槽
     softpipe->reduced_prim = PIPE_PRIM_POINTS;
     softpipe->viewport_index_slot = -1;
     softpipe->layer_slot = -1;
@@ -662,7 +989,7 @@ void setup_test(void)
     }
 
     
-    setup.posCoef.a0[0] = 0.0;
+    setup.posCoef.a0[0] = 0.0;          //插值系数
     setup.posCoef.a0[1] = 0.0;
     setup.posCoef.a0[2] = 0.0;
     setup.posCoef.a0[3] = 0.0;
@@ -679,6 +1006,7 @@ void setup_test(void)
     setup.max_layer = 0;
     setup.nr_vertex_attrs = 1;
 
+    #if 0
     float v0[4][4] = {
         {75.0, 75.0, 0.5, 1.0},
         {0.0, 0.0, 0.0, 0.0},
@@ -703,5 +1031,38 @@ void setup_test(void)
     softpipe->rasterizer->point_size = 50;
     softpipe->rasterizer->point_smooth = true;
     setup_point(&setup, v2);
-    softpipe_flush(softpipe, PIPE_FLUSH_END_OF_FRAME);
+    #endif
+    float v0[4][4] = {
+        {75.0, 150.0, 0.5, 1.0},
+        {0.0, 0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0, 0.0}
+    };
+    float v1[4][4] = {
+        {225.0, 150.0, 0.5, 1.0},
+        {0.0, 0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0, 0.0}
+    };
+    setup.softpipe->reduced_prim = PIPE_PRIM_LINES;
+    sp_setup_line(&setup, v0, v1);
+    float v2[4][4] = {
+    {150.0, 75.0, 0.5, 1.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0}
+    };
+    float v3[4][4] = {
+    {150.0, 225.0, 0.5, 1.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0}
+    };
+    sp_setup_line(&setup, v2, v3);
+    sp_setup_line(&setup, v0, v3);
+    sp_setup_line(&setup, v1, v2);
+    
+
+    softpipe_flush(softpipe, PIPE_FLUSH_END_OF_FRAME);      //刷新管线
 }
+

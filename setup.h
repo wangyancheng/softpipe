@@ -63,16 +63,43 @@ struct tgsi_interp_coef
 };
 
 /**
+ * Triangle edge info
+ */
+struct edge {
+   float dx;		/**< X(v1) - X(v0), used only during setup */
+   float dy;		/**< Y(v1) - Y(v0), used only during setup */
+   float dxdy;		/**< dx/dy */
+   float sx, sy;	/**< first sample point coord */
+   int lines;		/**< number of lines on this edge */
+};
+
+/**
  * setup上下文
  */
 struct setup_context {
-   int facing;                      //面 Front (0) , back (1)
    struct softpipe_context *softpipe;  //管线上下文
    struct quad_header quad[MAX_QUADS]; //四边形
+   /* 顶点只是构成每个属性的一系列浮子
+    * 转动。目前固定在4个浮子上，但应随时间变化。
+    * Codegen将有助于应对。
+   */
+   const float (*vmax)[4];          //顶点最大值
+   const float (*vmid)[4];          //顶点中间值
+   const float (*vmin)[4];          //顶点最小值
    const float (*vprovoke)[4];		//provoking vertex（激发顶点）
+
+   struct edge ebot;                //底边
+   struct edge etop;                //顶边
+   struct edge emaj;                //主要边
+   
+   float oneoverarea;               //面积的倒数
+   int facing;                      //面 Front (0) , back (1)
+
+   float pixel_offset;              //像素偏移
+   unsigned max_layer;              //最大层
+
    struct tgsi_interp_coef coef[PIPE_MAX_SHADER_INPUTS];
    struct tgsi_interp_coef posCoef;  //插值系数/* For Z, W */
-   unsigned max_layer;              //支持的最大层数
    unsigned nr_vertex_attrs;	      //顶点属性数量
    #if DEBUG_FRAGS
    unsigned int numFragsEmitted;  /**< per primitive */

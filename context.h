@@ -96,6 +96,7 @@ struct tgsi_shader_info
     unsigned properties[TGSI_PROPERTY_COUNT]; /* index with TGSI_PROPERTY_ */
     ubyte input_semantic_name[PIPE_MAX_SHADER_INPUTS]; /**< TGSI_SEMANTIC_x */
     bool writes_z;      // does fragment shader write Z value? 
+    ubyte input_cylindrical_wrap[PIPE_MAX_SHADER_INPUTS];      //输入槽的圆柱包裹
 };
 
 /**
