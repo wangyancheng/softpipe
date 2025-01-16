@@ -57,9 +57,9 @@ enum sp_interp_mode {
 */
 struct tgsi_interp_coef
 {
-   float a0[TGSI_NUM_CHANNELS];	   //provoking vertex, in an xyzw layout 
-   float dadx[TGSI_NUM_CHANNELS];   //x坐标偏移
-   float dady[TGSI_NUM_CHANNELS];   //y坐标偏移
+   float a0[TGSI_NUM_CHANNELS];	   //三角形在起始点的深度值类的值
+   float dadx[TGSI_NUM_CHANNELS];   //表示当x坐标增加1个单位时，深度值的变化量
+   float dady[TGSI_NUM_CHANNELS];   //表示当y坐标增加1个单位时，深度值的变化量
 };
 
 /**
@@ -78,7 +78,10 @@ struct edge {
  */
 struct setup_context {
    struct softpipe_context *softpipe;  //管线上下文
+
    struct quad_header quad[MAX_QUADS]; //四边形
+   struct quad_header *quad_ptrs[MAX_QUADS];
+   
    /* 顶点只是构成每个属性的一系列浮子
     * 转动。目前固定在4个浮子上，但应随时间变化。
     * Codegen将有助于应对。
@@ -100,11 +103,21 @@ struct setup_context {
 
    struct tgsi_interp_coef coef[PIPE_MAX_SHADER_INPUTS];
    struct tgsi_interp_coef posCoef;  //插值系数/* For Z, W */
-   unsigned nr_vertex_attrs;	      //顶点属性数量
+
+      struct {
+      int left[2];   /**< [0] = row0, [1] = row1 */
+      int right[2];
+      int y;
+   } span;        //跨度
+
+
    #if DEBUG_FRAGS
    unsigned int numFragsEmitted;  /**< per primitive */
    unsigned int numFragsWritten;  /**< per primitive */
-#endif
+   #endif
+
+   unsigned cull_face;		/* which faces cull */
+   unsigned nr_vertex_attrs;  //顶点属性数量
 };
 
 union fi {
@@ -113,6 +126,9 @@ union fi {
    uint32_t ui;
 };
 
+/**
+ * 是否是无穷大或NaN
+ */
 static inline bool
 util_is_inf_or_nan(float x)
 {

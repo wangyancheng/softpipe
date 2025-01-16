@@ -12,6 +12,7 @@
 #include "quad.h"
 #include <string.h>
 #include "flush.h"
+#include <math.h>
 
 #if DEBUG_VERTS
 static void
@@ -37,6 +38,82 @@ static inline int
 block(int x)
 {
    return x & ~(2-1);
+}
+
+static inline int
+block_x(int x)
+{
+   return x & ~(16-1);
+}
+
+#define CLAMP( X, MIN, MAX )  ( (X)>(MIN) ? ((X)>(MAX) ? (MAX) : (X)) : (MIN) )
+/**
+ * Render a horizontal span of quads
+ */
+static void
+flush_spans(struct setup_context *setup)
+{
+   const int step = MAX_QUADS;
+   const int xleft0 = setup->span.left[0];
+   const int xleft1 = setup->span.left[1];
+   const int xright0 = setup->span.right[0];
+   const int xright1 = setup->span.right[1];
+   struct quad_stage *pipe = setup->softpipe->quad.first;
+
+   const int minleft = block_x(MIN2(xleft0, xleft1));
+   const int maxright = MAX2(xright0, xright1);
+   int x;
+
+   /* process quads in horizontal chunks of 16 */
+   for (x = minleft; x < maxright; x += step) {
+      unsigned skip_left0 = CLAMP(xleft0 - x, 0, step);
+      unsigned skip_left1 = CLAMP(xleft1 - x, 0, step);
+      unsigned skip_right0 = CLAMP(x + step - xright0, 0, step);
+      unsigned skip_right1 = CLAMP(x + step - xright1, 0, step);
+      unsigned lx = x;
+      unsigned q = 0;
+
+      unsigned skipmask_left0 = (1U << skip_left0) - 1U;
+      unsigned skipmask_left1 = (1U << skip_left1) - 1U;
+
+      /* These calculations fail when step == 32 and skip_right == 0.
+       */
+      unsigned skipmask_right0 = ~0U << (unsigned)(step - skip_right0);
+      unsigned skipmask_right1 = ~0U << (unsigned)(step - skip_right1);
+
+      unsigned mask0 = ~skipmask_left0 & ~skipmask_right0;
+      unsigned mask1 = ~skipmask_left1 & ~skipmask_right1;
+
+      if (mask0 | mask1) {
+         do {
+            unsigned quadmask = (mask0 & 3) | ((mask1 & 3) << 2);
+            if (quadmask) {
+               setup->quad[q].input.x0 = lx;
+               setup->quad[q].input.y0 = setup->span.y;
+               setup->quad[q].input.facing = setup->facing;
+               setup->quad[q].inout.mask = quadmask;
+               setup->quad_ptrs[q] = &setup->quad[q];
+               q++;
+#if DEBUG_FRAGS
+               setup->numFragsEmitted += util_bitcount(quadmask);
+#endif
+            }
+            mask0 >>= 2;
+            mask1 >>= 2;
+            lx += 2;
+         } while (mask0 | mask1);
+
+         //pipe->run( pipe, setup->quad_ptrs, q );
+         shade_quads(pipe, setup->quad_ptrs, q);
+      }
+   }
+
+
+   setup->span.y = 0;
+   setup->span.right[0] = 0;
+   setup->span.right[1] = 0;
+   setup->span.left[0] = 1000000;     /* greater than right[0] */
+   setup->span.left[1] = 1000000;     /* greater than right[1] */
 }
 
 /**
@@ -723,6 +800,588 @@ setup_point(struct setup_context *setup,
     }
 }
 
+/**
+ * 计算a0，dadx和dady，以线性插值系数，
+ * 用于三角形。
+ * V[0]，V[1]和V[2]分别为VMIN，VMID和VMAX。
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param coef -[in/out] 插值系数
+ * \param i -[in] 组件索引
+ * \param v -[in] 顶点数据
+ */
+static void
+tri_linear_coeff(struct setup_context *setup,
+                 struct tgsi_interp_coef *coef,
+                 uint i,
+                 const float v[3])
+{
+   float botda = v[1] - v[0];       //底边的深度差值
+   float majda = v[2] - v[0];       //主边的深度差值
+   float a = setup->ebot.dy * majda - botda * setup->emaj.dy;     //
+   float b = setup->emaj.dx * botda - majda * setup->ebot.dx;     //
+   float dadx = a * setup->oneoverarea;      //计算dadx
+   float dady = b * setup->oneoverarea;      //计算dady
+
+   assert(i <= 3);
+
+   coef->dadx[i] = dadx;
+   coef->dady[i] = dady;
+
+   /* 
+    * 计算 a0 作为在 (0,0) 处采样得到的片段的值。
+    * 考虑到我们希望在像素中心 (pixel_offset, pixel_offset) 处进行采样。
+    * 这种方法对于 dadx 或 dady 值非常大的三角形来说效果不佳，
+    * 因为这将导致从 a0 中减去并重新加上一个非常大的数字，
+    * 这意味着我们将丢失 a0 中的大量小数位精度。
+    * 解决这个问题的方法是将 a0 定义为靠近 vmin 的某个像素中心的采样值。
+    * 我稍后将切换到这种方法。
+    */
+   coef->a0[i] = (v[0] -
+                  (dadx * (setup->vmin[0][0] - setup->pixel_offset) +
+                   dady * (setup->vmin[0][1] - setup->pixel_offset)));
+}
+
+/* Apply cylindrical wrapping to v0, v1, v2 coordinates, if enabled.
+ * Input coordinates must be in [0, 1] range, otherwise results are undefined.
+ * Some combinations of coordinates produce invalid results,
+ * but this behaviour is acceptable.
+ */
+static void
+tri_apply_cylindrical_wrap(float v0,
+                           float v1,
+                           float v2,
+                           uint cylindrical_wrap,
+                           float output[3])
+{
+   if (cylindrical_wrap) {
+      float delta;
+
+      delta = v1 - v0;
+      if (delta > 0.5f) {
+         v0 += 1.0f;
+      }
+      else if (delta < -0.5f) {
+         v1 += 1.0f;
+      }
+
+      delta = v2 - v1;
+      if (delta > 0.5f) {
+         v1 += 1.0f;
+      }
+      else if (delta < -0.5f) {
+         v2 += 1.0f;
+      }
+
+      delta = v0 - v2;
+      if (delta > 0.5f) {
+         v2 += 1.0f;
+      }
+      else if (delta < -0.5f) {
+         v0 += 1.0f;
+      }
+   }
+
+   output[0] = v0;
+   output[1] = v1;
+   output[2] = v2;
+}
+
+/**
+ * Compute a0, dadx and dady for a perspective-corrected interpolant,
+ * for a triangle.
+ * We basically multiply the vertex value by 1/w before computing
+ * the plane coefficients (a0, dadx, dady).
+ * Later, when we compute the value at a particular fragment position we'll
+ * divide the interpolated value by the interpolated W at that fragment.
+ * v[0], v[1] and v[2] are vmin, vmid and vmax, respectively.
+ */
+static void
+tri_persp_coeff(struct setup_context *setup,
+                struct tgsi_interp_coef *coef,
+                uint i,
+                const float v[3])
+{
+   /* premultiply by 1/w  (v[0][3] is always W):
+    */
+   float mina = v[0] * setup->vmin[0][3];
+   float mida = v[1] * setup->vmid[0][3];
+   float maxa = v[2] * setup->vmax[0][3];
+   float botda = mida - mina;
+   float majda = maxa - mina;
+   float a = setup->ebot.dy * majda - botda * setup->emaj.dy;
+   float b = setup->emaj.dx * botda - majda * setup->ebot.dx;
+   float dadx = a * setup->oneoverarea;
+   float dady = b * setup->oneoverarea;
+
+   assert(i <= 3);
+
+   coef->dadx[i] = dadx;
+   coef->dady[i] = dady;
+   coef->a0[i] = (mina -
+                  (dadx * (setup->vmin[0][0] - setup->pixel_offset) +
+                   dady * (setup->vmin[0][1] - setup->pixel_offset)));
+}
+
+
+/**
+ * 计算 setup->coef[] 数组中的 dadx、dady、a0 值。
+ * 必须在 setup->vmin、vmid、vmax、vprovoke 初始化之后调用。
+ * 
+ * \param setup -[in/out] setup上下文
+ */
+static void
+setup_tri_coefficients(struct setup_context *setup)
+{
+   struct softpipe_context *softpipe = setup->softpipe;
+   const struct tgsi_shader_info *fsInfo = &setup->softpipe->fs_variant->info;
+   const struct sp_setup_info *sinfo = &softpipe->setup_info;
+   uint fragSlot;
+   float v[3];
+
+   assert(sinfo->valid);
+
+   /* Z和W是通过线性插值完成的：
+    */
+   v[0] = setup->vmin[0][2];     //顶点最小值的z坐标
+   v[1] = setup->vmid[0][2];     //顶点中间值的z坐标
+   v[2] = setup->vmax[0][2];     //顶点最大值的z坐标
+   tri_linear_coeff(setup, &setup->posCoef, 2, v);
+
+   v[0] = setup->vmin[0][3];     //顶点最小值的w坐标
+   v[1] = setup->vmid[0][3];     //顶点中间值的w坐标
+   v[2] = setup->vmax[0][3];     //顶点最大值的w坐标
+   tri_linear_coeff(setup, &setup->posCoef, 3, v);
+
+   /* 所有其余属性的设置插值:
+    */
+   for (fragSlot = 0; fragSlot < fsInfo->num_inputs; fragSlot++) {
+      const uint vertSlot = sinfo->attrib[fragSlot].src_index;
+      uint j;
+
+      switch (sinfo->attrib[fragSlot].interp) {
+      //常量插值
+      case SP_INTERP_CONSTANT:
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            const_coeff(setup, &setup->coef[fragSlot], vertSlot, j);
+         }
+         break;
+      //线性插值
+      case SP_INTERP_LINEAR:
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            tri_apply_cylindrical_wrap(setup->vmin[vertSlot][j],
+                                       setup->vmid[vertSlot][j],
+                                       setup->vmax[vertSlot][j],
+                                       fsInfo->input_cylindrical_wrap[fragSlot] & (1 << j),
+                                       v);
+            tri_linear_coeff(setup, &setup->coef[fragSlot], j, v);
+         }
+         break;
+      case SP_INTERP_PERSPECTIVE:
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            tri_apply_cylindrical_wrap(setup->vmin[vertSlot][j],
+                                       setup->vmid[vertSlot][j],
+                                       setup->vmax[vertSlot][j],
+                                       fsInfo->input_cylindrical_wrap[fragSlot] & (1 << j),
+                                       v);
+            tri_persp_coeff(setup, &setup->coef[fragSlot], j, v);
+         }
+         break;
+      //
+      case SP_INTERP_POS:
+         setup_fragcoord_coeff(setup, fragSlot);
+         break;
+      default:
+         assert(0);
+      }
+
+      if (fsInfo->input_semantic_name[fragSlot] == TGSI_SEMANTIC_FACE) {
+         /* convert 0 to 1.0 and 1 to -1.0 */
+         setup->coef[fragSlot].a0[0] = setup->facing * -2.0f + 1.0f;
+         setup->coef[fragSlot].dadx[0] = 0.0;
+         setup->coef[fragSlot].dady[0] = 0.0;
+      }
+
+      if (0) {
+         for (j = 0; j < TGSI_NUM_CHANNELS; j++) {
+            printf("attr[%d].%c: a0:%f dx:%f dy:%f\n",
+                         fragSlot, "xyzw"[j],
+                         setup->coef[fragSlot].a0[j],
+                         setup->coef[fragSlot].dadx[j],
+                         setup->coef[fragSlot].dady[j]);
+         }
+      }
+   }
+}
+
+
+static void
+setup_tri_edges(struct setup_context *setup)
+{
+   float vmin_x = setup->vmin[0][0] + setup->pixel_offset;
+   float vmid_x = setup->vmid[0][0] + setup->pixel_offset;
+
+   float vmin_y = setup->vmin[0][1] - setup->pixel_offset;
+   float vmid_y = setup->vmid[0][1] - setup->pixel_offset;
+   float vmax_y = setup->vmax[0][1] - setup->pixel_offset;
+
+   setup->emaj.sy = ceilf(vmin_y);
+   setup->emaj.lines = (int) ceilf(vmax_y - setup->emaj.sy);
+   setup->emaj.dxdy = setup->emaj.dy ? setup->emaj.dx / setup->emaj.dy : .0f;
+   setup->emaj.sx = vmin_x + (setup->emaj.sy - vmin_y) * setup->emaj.dxdy;
+
+   setup->etop.sy = ceilf(vmid_y);
+   setup->etop.lines = (int) ceilf(vmax_y - setup->etop.sy);
+   setup->etop.dxdy = setup->etop.dy ? setup->etop.dx / setup->etop.dy : .0f;
+   setup->etop.sx = vmid_x + (setup->etop.sy - vmid_y) * setup->etop.dxdy;
+
+   setup->ebot.sy = ceilf(vmin_y);
+   setup->ebot.lines = (int) ceilf(vmid_y - setup->ebot.sy);
+   setup->ebot.dxdy = setup->ebot.dy ? setup->ebot.dx / setup->ebot.dy : .0f;
+   setup->ebot.sx = vmin_x + (setup->ebot.sy - vmin_y) * setup->ebot.dxdy;
+}
+
+
+/**
+ * 渲染三角形的上半部分或下半部分。
+ * 这里也应用了剪裁/裁剪矩形。
+ */
+static void
+subtriangle(struct setup_context *setup,
+            struct edge *eleft,
+            struct edge *eright,
+            int lines,
+            unsigned viewport_index)
+{
+   const struct pipe_scissor_state *cliprect = &setup->softpipe->cliprect[viewport_index];
+   const int minx = (int) cliprect->minx;
+   const int maxx = (int) cliprect->maxx;
+   const int miny = (int) cliprect->miny;
+   const int maxy = (int) cliprect->maxy;
+   int y, start_y, finish_y;
+   int sy = (int)eleft->sy;
+
+   assert((int)eleft->sy == (int) eright->sy);
+   assert(lines >= 0);
+
+   /* clip top/bottom */
+   start_y = sy;
+   if (start_y < miny)
+      start_y = miny;
+
+   finish_y = sy + lines;
+   if (finish_y > maxy)
+      finish_y = maxy;
+
+   start_y -= sy;
+   finish_y -= sy;
+
+   /*
+   debug_printf("%s %d %d\n", __FUNCTION__, start_y, finish_y);
+   */
+
+   for (y = start_y; y < finish_y; y++) {
+
+      /* avoid accumulating adds as floats don't have the precision to
+       * accurately iterate large triangle edges that way.  luckily we
+       * can just multiply these days.
+       *
+       * this is all drowned out by the attribute interpolation anyway.
+       */
+      int left = (int)(eleft->sx + y * eleft->dxdy);
+      int right = (int)(eright->sx + y * eright->dxdy);
+
+      /* clip left/right */
+      if (left < minx)
+         left = minx;
+      if (right > maxx)
+         right = maxx;
+
+      if (left < right) {
+         int _y = sy + y;
+         if (block(_y) != setup->span.y) {
+            flush_spans(setup);
+            setup->span.y = block(_y);
+         }
+
+         setup->span.left[_y&1] = left;
+         setup->span.right[_y&1] = right;
+      }
+   }
+
+
+   /* save the values so that emaj can be restarted:
+    */
+   eleft->sx += lines * eleft->dxdy;
+   eright->sx += lines * eright->dxdy;
+   eleft->sy += lines;
+   eright->sy += lines;
+}
+
+/**
+ * 计算三角形的面积。
+ * 通过叉乘计算三角形的面积。
+ * 三角形的面积等于叉乘的z值的一半。
+ * 如果面积为正，则三角形为逆时针方向。
+ * 如果面积为负，则三角形为顺时针方向。
+ *
+ * \param v0 -[in] 三角形的第一个顶点
+ * \param v1 -[in] 三角形的第二个顶点
+ * \param v2 -[in] 三角形的第三个顶点
+ * \return 三角形的面积
+ */
+static float
+calc_det(const float (*v0)[4],
+         const float (*v1)[4],
+         const float (*v2)[4])
+{
+   /* edge vectors e = v0 - v2, f = v1 - v2 */
+   const float ex = v0[0][0] - v2[0][0];     //v0的x坐标 - v2的x坐标
+   const float ey = v0[0][1] - v2[0][1];     //v0的y坐标 - v2的y坐标
+   const float fx = v1[0][0] - v2[0][0];     //v1的x坐标 - v2的x坐标
+   const float fy = v1[0][1] - v2[0][1];     //v1的y坐标 - v2的y坐标
+
+   /* det = cross(e,f).z */
+   return ex * fy - ey * fx;        //叉乘
+}
+
+/**
+**
+ * 将顶点从上到下排序，设置三角形
+ * 边缘字段（Ebot，Emaj，Etop）。
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param det -[in] 三角形的面积
+ * \param v0 -[in] 三角形的第一个顶点
+ * \param v1 -[in] 三角形的第二个顶点
+ * \param v2 -[in] 三角形的第三个顶点
+ * 
+ * \return FALSE if coords are inf/nan (cull the tri), TRUE otherwise
+ */
+static bool
+setup_sort_vertices(struct setup_context *setup,
+                    float det,
+                    const float (*v0)[4],
+                    const float (*v1)[4],
+                    const float (*v2)[4])
+{
+   //1. 设置激发顶点
+   if (setup->softpipe->rasterizer->flatshade_first)
+      setup->vprovoke = v0;         //激发顶点
+   else
+      setup->vprovoke = v2;
+
+   //2. 确定顶点的底部到最高顺序 
+   {
+      float y0 = v0[0][1];
+      float y1 = v1[0][1];
+      float y2 = v2[0][1];
+      if (y0 <= y1) {
+	 if (y1 <= y2) {
+	    /* y0<=y1<=y2 */
+	    setup->vmin = v0;         //最小的顶点
+	    setup->vmid = v1;         //中间的顶点
+	    setup->vmax = v2;         //最大的顶点
+	 }
+	 else if (y2 <= y0) {
+	    /* y2<=y0<=y1 */
+	    setup->vmin = v2;
+	    setup->vmid = v0;
+	    setup->vmax = v1;
+	 }
+	 else {
+	    /* y0<=y2<=y1 */
+	    setup->vmin = v0;
+	    setup->vmid = v2;
+	    setup->vmax = v1;
+	 }
+      }
+      else {
+	 if (y0 <= y2) {
+	    /* y1<=y0<=y2 */
+	    setup->vmin = v1;
+	    setup->vmid = v0;
+	    setup->vmax = v2;
+	 }
+	 else if (y2 <= y1) {
+	    /* y2<=y1<=y0 */
+	    setup->vmin = v2;
+	    setup->vmid = v1;
+	    setup->vmax = v0;
+	 }
+	 else {
+	    /* y1<=y2<=y0 */
+	    setup->vmin = v1;
+	    setup->vmid = v2;
+	    setup->vmax = v0;
+	 }
+      }
+   }
+
+   //3. 计算三角形的边长度
+   setup->ebot.dx = setup->vmid[0][0] - setup->vmin[0][0];     //底部边的x长度
+   setup->ebot.dy = setup->vmid[0][1] - setup->vmin[0][1];     //底部边的y长度
+   setup->emaj.dx = setup->vmax[0][0] - setup->vmin[0][0];     //主要边的x长度
+   setup->emaj.dy = setup->vmax[0][1] - setup->vmin[0][1];     //主要边的y长度
+   setup->etop.dx = setup->vmax[0][0] - setup->vmid[0][0];     //顶部边的x长度
+   setup->etop.dy = setup->vmax[0][1] - setup->vmid[0][1];     //顶部边的y长度
+
+   /*
+    * 计算三角形的面积。
+    * 
+    * 后续使用 1/面积 来计算属性的偏导数（用于计算重心坐标）。
+    * 三角形的面积将与 prim->det 相同，但符号可能不同，具体取决于顶点排序的方式。
+    * 为了确定图元是正面还是背面，我们使用 prim->det 的值，因为它的符号是正确的。
+    */
+   //4. 计算三角形的面积
+   {
+      const float area = (setup->emaj.dx * setup->ebot.dy -    //三角形的面积
+			    setup->ebot.dx * setup->emaj.dy);
+
+      setup->oneoverarea = 1.0f / area;      //面积的倒数
+
+      /*
+      debug_printf("%s one-over-area %f  area %f  det %f\n",
+                   __FUNCTION__, setup->oneoverarea, area, det );
+      */
+      //如果面积为inf或nan，说明在这种情况下，三角形是不可见的
+      if (util_is_inf_or_nan(setup->oneoverarea))
+         return false;
+   }
+
+   /* 
+    * 我们需要知道这是一个正面还是背面三角形，用于：
+    * GLSL 的 gl_FrontFacing 片段属性（bool 类型）
+    * 双面模板测试
+    * 其中：
+    * 0 = 正面
+    * 1 = 背面
+    */
+   //5. 设置三角形的正面还是背面
+   setup->facing = 
+      ((det < 0.0) ^ 
+       (setup->softpipe->rasterizer->front_ccw));
+
+   {
+      unsigned face = setup->facing == 0 ? PIPE_FACE_FRONT : PIPE_FACE_BACK;
+      //6. 根据glCullFace剔除三角形
+      if (face & setup->cull_face)
+	 return false;
+   }
+
+
+   /* 准备像素偏移用于光栅化：
+    * - 对于 GL： 像素中心为 (0.5, 0.5)。
+    * - 对于其他 API： 假设像素中心为 (0.0, 0.0)。
+    */
+   //7. 设置像素偏移
+   if (setup->softpipe->rasterizer->half_pixel_center) {
+      setup->pixel_offset = 0.5f;
+   } else {
+      setup->pixel_offset = 0.0f;
+   }
+
+   return true;
+}
+
+/**
+ * Do setup for triangle rasterization, then render the triangle.
+ * 
+ * \param setup -[in/out] setup上下文
+ * \param v0 -[in] 三角形的第一个顶点
+ * \param v1 -[in] 三角形的第二个顶点
+ * \param v2 -[in] 三角形的第三个顶点
+ */
+void
+sp_setup_tri(struct setup_context *setup,
+             const float (*v0)[4],
+             const float (*v1)[4],
+             const float (*v2)[4])
+{
+   float det;           //三角形的面积
+   uint layer = 0;
+   unsigned viewport_index = 0;
+#if DEBUG_VERTS
+   printf("Setup triangle:\n");
+   print_vertex(setup, v0);
+   print_vertex(setup, v1);
+   print_vertex(setup, v2);
+#endif
+
+   if (setup->softpipe->rasterizer->rasterizer_discard)
+      return;
+   
+   //1. 计算三角形的面积
+   det = calc_det(v0, v1, v2);      //计算三角形的面积，用于判断三角形的正面还是背面
+   /*
+   debug_printf("%s\n", __FUNCTION__ );
+   */
+
+#if DEBUG_FRAGS
+   setup->numFragsEmitted = 0;
+   setup->numFragsWritten = 0;
+#endif
+
+   //2. 三角形排序等一些操作
+   if (!setup_sort_vertices( setup, det, v0, v1, v2 ))
+      return;
+
+   //3. 计算三角形的插值系数
+   setup_tri_coefficients( setup );    //计算三角形的插值系数
+
+   //4. 设置三角形的边
+   setup_tri_edges( setup );           //设置三角形的边
+
+   assert(setup->softpipe->reduced_prim == PIPE_PRIM_TRIANGLES);
+
+   setup->span.y = 0;            //初始化span的y坐标
+   setup->span.right[0] = 0;     //初始化span的右边界
+   setup->span.right[1] = 0;     //初始化span的右边界
+
+   //5. 甚至layer
+   /*   setup->span.z_mode = tri_z_mode( setup->ctx ); */
+   if (setup->softpipe->layer_slot > 0) {
+      layer = *(unsigned *)setup->vprovoke[setup->softpipe->layer_slot];
+      layer = MIN2(layer, setup->max_layer);
+   }
+   setup->quad[0].input.layer = layer;
+
+   //6. 设置viewport_index
+   if (setup->softpipe->viewport_index_slot > 0) {
+      unsigned *udata = (unsigned*)v0[setup->softpipe->viewport_index_slot];
+      viewport_index = sp_clamp_viewport_idx(*udata);
+   }
+   setup->quad[0].input.viewport_index = viewport_index;
+
+   /*   init_constant_attribs( setup ); */
+
+   if (setup->oneoverarea < 0.0) {
+      /* 主边在左:
+       */
+      subtriangle(setup, &setup->emaj, &setup->ebot, setup->ebot.lines, viewport_index);
+      subtriangle(setup, &setup->emaj, &setup->etop, setup->etop.lines, viewport_index);
+   }
+   else {
+      /* 主边在右:
+       */
+      subtriangle(setup, &setup->ebot, &setup->emaj, setup->ebot.lines, viewport_index);
+      subtriangle(setup, &setup->etop, &setup->emaj, setup->etop.lines, viewport_index);
+   }
+
+   flush_spans( setup );
+
+   if (setup->softpipe->active_statistics_queries) {
+      setup->softpipe->pipeline_statistics.c_primitives++;
+   }
+
+#if DEBUG_FRAGS
+   printf("Tri: %u frags emitted, %u written\n",
+          setup->numFragsEmitted,
+          setup->numFragsWritten);
+#endif
+}
+
+
 #define MALLOC_STRUCT(T)   (struct T *) malloc(sizeof(struct T))
 #define MALLOC(_size)  malloc(_size)
 
@@ -1032,6 +1691,7 @@ void setup_test(void)
     softpipe->rasterizer->point_smooth = true;
     setup_point(&setup, v2);
     #endif
+    #if 0
     float v0[4][4] = {
         {75.0, 150.0, 0.5, 1.0},
         {0.0, 0.0, 0.0, 0.0},
@@ -1061,7 +1721,27 @@ void setup_test(void)
     sp_setup_line(&setup, v2, v3);
     sp_setup_line(&setup, v0, v3);
     sp_setup_line(&setup, v1, v2);
-    
+    #endif
+    float v0[4][4] = {
+    {100.0, 100.0, 0.5, 1.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0},
+    {0.0, 0.0, 0.0, 0.0}
+    };
+    float v1[4][4] = {
+   {200.0, 100.0, 0.5, 1.0},
+   {0.0, 0.0, 0.0, 0.0},
+   {0.0, 0.0, 0.0, 0.0},
+   {0.0, 0.0, 0.0, 0.0}
+   };
+   float v2[4][4] = {
+   {150.0, 200.0, 0.5, 1.0},
+   {0.0, 0.0, 0.0, 0.0},
+   {0.0, 0.0, 0.0, 0.0},
+   {0.0, 0.0, 0.0, 0.0}
+   };
+   setup.softpipe->reduced_prim = PIPE_PRIM_TRIANGLES;
+    sp_setup_tri(&setup, v0, v1, v2);
 
     softpipe_flush(softpipe, PIPE_FLUSH_END_OF_FRAME);      //刷新管线
 }

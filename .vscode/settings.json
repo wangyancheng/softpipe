@@ -20,7 +20,9 @@
         "streambuf": "c",
         "type_traits": "c",
         "debug_img.h": "c",
-        "quad_blend.h": "c"
+        "quad_blend.h": "c",
+        "mathcalls.h": "c",
+        "flush.h": "c"
     },
     "makefile.configureOnOpen": false
 }

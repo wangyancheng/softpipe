@@ -11,6 +11,12 @@ typedef unsigned char      ubyte;
 #define PIPE_MAX_SHADER_OUTPUTS   80 /* 32 GENERIC + 32 PATCH + 16 others */
 #define PIPE_MAX_VIEWPORTS        16
 
+/** Polygon face specification, eg for culling */
+#define PIPE_FACE_NONE           0
+#define PIPE_FACE_FRONT          1
+#define PIPE_FACE_BACK           2
+#define PIPE_FACE_FRONT_AND_BACK (PIPE_FACE_FRONT | PIPE_FACE_BACK)
+
 /**
  * Inequality functions.  Used for depth test, stencil compare, alpha
  * test, shadow compare, etc.

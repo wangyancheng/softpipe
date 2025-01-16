@@ -9,6 +9,8 @@
                 "-g",
                 "-W",
                 "-Wall",
+                "-lm",
+                "-ldl",
                 "-fsanitize=address",
                 "${workspaceFolder}/*.c",
                 "-o",
